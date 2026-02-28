@@ -513,6 +513,33 @@ from HFThreads import HFThreads
 threads = HFThreads(token).get_all_by_user(uid=761578)
 ```
 
+### Get all threads a user has participated in
+
+`threads _uid` only returns threads where the user is the OP. To find threads they replied to but didn't create, pull their posts instead:
+
+```python
+from HFThreads import HFThreads
+from HFPosts   import HFPosts
+
+posts = HFPosts(token).get_by_user(uid=761578)
+participated_tids = list({int(p["tid"]) for p in posts})
+threads = HFThreads(token).get_many(participated_tids)
+```
+
+### Lightweight thread poll — lastposter is a free field
+
+`poll_lastpost()` is a cheap batched call for checking activity across many threads at once. `lastposter` (the replier's username) comes back on every thread response for free — no follow-up `users _uid` call needed:
+
+```python
+from HFThreads import HFThreads
+
+rows = HFThreads(token).poll_lastpost([6083735, 6084000, 6085000])
+
+for t in rows:
+    print(t["tid"], t["lastposter"], t["lastpost"])
+    # lastposter is the username string — already there, no extra call needed
+```
+
 ### Parse BBCode from a post
 ```python
 from HFBBCode import HFBBCode
@@ -622,13 +649,18 @@ Available on: `HFPosts`, `HFThreads`, `HFBytes`, `HFContracts`, `HFBratings`
 ## Notes
 
 - **Rate limit** — HF enforces a rolling hourly call limit and returns `MAX_HOURLY_CALLS_EXCEEDED` in the response body when you hit it. The remaining call count comes back in the `x-rate-limit-remaining` header on every response.
-- **Proxy** — Cloudflare blocks datacenter and VPS IPs. If you're running the bot on a server you need a residential proxy, otherwise every request gets blocked before it reaches HF.
+- **Proxy** — Cloudflare sometimes blocks datacenter and VPS IPs. 
 - **Disputes** — Querying disputes by `_uid` consistently returns 503. The only reliable filters are `_cid` (contract ID) and `_cdid` (dispute ID).
 - **Thread batches** — When fetching multiple TIDs in one request, a single private or deleted thread will cause the whole batch to fail. Bisect the list to find the bad TID.
 - **Token expiry** — Tokens last around 90 days. Once expired the API returns 401 on every call. Re-auth via `hf auth start`.
 - **Scopes** — Permissions are configured per-app on the HF Developer Panel. If an endpoint returns nothing or 403, check that your app has the required scope. Each class docstring lists what it needs.
 - **BBCode** — Every `message` field from the API is raw BBCode. Run it through `HFBBCode.to_text()` before displaying, searching, or logging anything.
 - **Response types** — The API returns everything as strings, including numeric fields like `pid`, `uid`, and `amount`. Cast them yourself: `int(post["pid"])`, `float(tx["amount"])`.
+- **`threads _uid` is OP-only** — This endpoint only returns threads where the user is the original poster. Threads they replied to but didn't create are invisible here. Use `posts _uid` (`HFPosts.get_by_user()`) to find all threads a user has participated in.
+- **`lastposter` is a free field** — Every thread response includes `lastposter` (the replier's username string) at no extra cost. You don't need a follow-up `users _uid` call just to get a display name for whoever last posted. `poll_lastpost()` requests it by default.
+- **Users batching and 503s** — Similar 503 behaviour to disputes can occur with `users _uid` in certain contexts. If you're doing regular status checks on a list of users, make one call per user rather than batching them all together.
+- **Forum watching and poll overhead** — `watch_forum()` tracks every thread it sees in `_seen_tids`. If you only want new thread alerts (not replies to every thread in the forum), don't funnel discovered TIDs into `watch_thread()` — let `posts _uid` discovery handle threads you actually reply to. Otherwise you end up polling hundreds of threads you don't care about.
+- **Hot/cold polling** — `watch_thread()` polls all registered threads at the same fixed interval. If you're tracking many threads, threads with recent activity (hot) are worth polling frequently; threads with no posts in 30+ minutes (cold) aren't. Managing your own poll loop with two different intervals cuts call volume significantly without missing anything.
 
 ---
 
@@ -797,7 +829,11 @@ BBCode().strikethrough("text").build()            # [s]text[/s]
 BBCode().color("text", "red").build()             # [color=red]text[/color]
 BBCode().color("text", "#0070f3").build()         # hex color
 BBCode().size("text", 20).build()                 # [size=20]text[/size]
-BBCode().center("text").build()                   # [center]text[/center]
+BBCode().font("text", "Times New Roman").build()  # [font=Times New Roman]text[/font]
+BBCode().left("text").build()                     # [align=left]text[/align]
+BBCode().center("text").build()                   # [align=center]text[/align]
+BBCode().right("text").build()                    # [align=right]text[/align]
+BBCode().justify("text").build()                  # [align=justify]text[/align]
 BBCode().url("https://hf.net", "HF").build()      # [url=...]HF[/url]
 BBCode().thread_link(6083735, "API thread").build()
 BBCode().profile_link(761578, "AuJusDemon").build()
