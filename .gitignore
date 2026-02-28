@@ -1,0 +1,18 @@
+# In your repo folder, create .gitignore with these contents:
+```
+```
+# Credentials - NEVER commit
+hf_config.py
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Egg info
+*.egg-info/
+dist/
+build/
+
+# Token storage
+tmp/
