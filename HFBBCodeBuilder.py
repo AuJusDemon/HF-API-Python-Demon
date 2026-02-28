@@ -51,6 +51,16 @@ Usage:
     )
 
 All methods return self for chaining. Call build() at the end to get the string.
+
+HF ALIGNMENT NOTE:
+    HackForums uses [align=x] syntax, not [left]/[center]/[right] standalone tags.
+    Valid values: left, center, right, justify
+    Example: [align=center]text[/align]
+
+HF FONT NOTE:
+    Valid font names on HackForums (from the editor dropdown):
+    Arial, Arial Black, Comic Sans MS, Courier New, Georgia, Impact,
+    Sans-serif, Serif, Times New Roman, Trebuchet MS, Verdana
 """
 
 
@@ -197,15 +207,27 @@ class BBCode:
         return self
 
     def font(self, text: str, font_family: str) -> "BBCode":
-        """Set font family. → [font=family]text[/font]"""
+        """
+        Set font family.
+
+        Valid fonts on HackForums:
+            Arial, Arial Black, Comic Sans MS, Courier New, Georgia,
+            Impact, Sans-serif, Serif, Times New Roman, Trebuchet MS, Verdana
+
+        Example:
+            BBCode().font("Hello", "Times New Roman").build()
+            # "[font=Times New Roman]Hello[/font]"
+        """
         self._parts.append(f"[font={font_family}]{text}[/font]")
         return self
 
     # ── Alignment ──────────────────────────────────────────────────────────────
+    # HackForums uses [align=x] syntax. [center], [left], [right] standalone
+    # tags do NOT work on HF — only [align=center] etc. are valid.
 
     def left(self, content: str) -> "BBCode":
-        """Left-align content. → [left]content[/left]"""
-        self._parts.append(f"[left]{content}[/left]")
+        """Left-align content. → [align=left]content[/align]"""
+        self._parts.append(f"[align=left]{content}[/align]")
         return self
 
     def center(self, content: str) -> "BBCode":
@@ -217,14 +239,19 @@ class BBCode:
 
         Example:
             BBCode().center(BBCode().bold("Centered Title").build()).build()
-            # "[center][b]Centered Title[/b][/center]"
+            # "[align=center][b]Centered Title[/b][/align]"
         """
-        self._parts.append(f"[center]{content}[/center]")
+        self._parts.append(f"[align=center]{content}[/align]")
         return self
 
     def right(self, content: str) -> "BBCode":
-        """Right-align content. → [right]content[/right]"""
-        self._parts.append(f"[right]{content}[/right]")
+        """Right-align content. → [align=right]content[/align]"""
+        self._parts.append(f"[align=right]{content}[/align]")
+        return self
+
+    def justify(self, content: str) -> "BBCode":
+        """Justify content. → [align=justify]content[/align]"""
+        self._parts.append(f"[align=justify]{content}[/align]")
         return self
 
     # ── Links ──────────────────────────────────────────────────────────────────
