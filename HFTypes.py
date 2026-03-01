@@ -112,11 +112,28 @@ class HFPostWriteResult(TypedDict):
 
 # ── Threads ────────────────────────────────────────────────────────────────────
 
+class HFFirstPost(TypedDict):
+    """
+    Inline OP post object returned when firstpost:True is requested in a threads ask.
+    This is NOT a post ID — it is a small dict containing the OP's pid and raw BBCode message.
+
+    Usage:
+        fp      = thread.get("firstpost") or {}
+        pid     = fp.get("pid", "")
+        snippet = HFBBCode.to_text(fp.get("message", ""))
+    """
+    pid:     str
+    message: str   # raw BBCode — use HFBBCode.to_text() to strip
+
+
 class HFThread(TypedDict):
     """
     /read/threads response. Requires 'Posts' scope.
-    lastpost is a unix timestamp (not a post ID).
-    firstpost IS a post ID (the OP's pid).
+
+    lastpost   — unix timestamp of the most recent reply (NOT a post ID).
+    firstpost  — when requested via firstpost:True, returns an HFFirstPost dict
+                 {pid, message} containing the OP's post ID and raw BBCode content.
+                 It is NOT just a post ID string. Omitted entirely if not requested.
     """
     tid:           str
     uid:           str   # OP user ID
@@ -126,9 +143,8 @@ class HFThread(TypedDict):
     numreplies:    str
     views:         str
     dateline:      str   # unix timestamp of thread creation
-    firstpost:     str   # post ID of the OP
-    lastpost:      str   # unix timestamp of last reply
-    lastposter:    str   # username of last poster
+    lastpost:      str   # unix timestamp of last reply — NOT a post ID
+    lastposter:    str   # username of last poster (free field — no extra cost)
     lastposteruid: str
     prefix:        str
     icon:          str
@@ -136,6 +152,9 @@ class HFThread(TypedDict):
     username:      str   # OP username
     sticky:        str   # "1" if sticky
     bestpid:       str   # best post ID (if voted)
+    # firstpost is only present when explicitly requested (firstpost:True in asks).
+    # Returns {pid, message} — NOT a bare post ID string.
+    firstpost:     NotRequired["HFFirstPost"]
 
 
 class HFThreadWriteResult(TypedDict):
@@ -285,6 +304,8 @@ class HFDispute(TypedDict):
     /read/disputes response. Requires 'Contracts' scope.
 
     IMPORTANT: Query by _cid or _cdid only — _uid returns 503.
+    Disputes can be opened on ANY contract status including complete and
+    cancelled — do not filter by contract status before querying disputes.
     dispute_tid is the thread where the dispute is being handled.
     """
     cdid:           str   # dispute ID
