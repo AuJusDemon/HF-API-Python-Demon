@@ -1,16 +1,11 @@
 """
 HFWatcher.py — Polling watcher for HackForums events.
 
-Bug fixes applied:
-  - Bug #4: _my_uid=0 permanently killed the bytes watcher. The UID fetch is
-    now scoped to _BytesWatch (not shared on self), and if uid resolves to 0
-    (empty/missing field) it is treated as a transient failure and retried
-    next poll instead of permanently short-circuiting.
+New event types (all fired from _poll_thread at zero extra API cost):
+  - thread_best_answer : someone marked a post as the best answer in the thread
+  - thread_view_spike  : views jumped by VIEW_SPIKE or more in one poll cycle
+  - thread_closed      : thread transitioned from open to closed
 
-  - Bug #6: The keyword watcher used a single _seen_pids set for both thread
-    IDs and post IDs. A thread with tid=X and a post with pid=X would collide
-    and one would be silently skipped. Fixed by splitting into _seen_tids and
-    _seen_pids.
 """
 
 import asyncio
@@ -26,6 +21,9 @@ log = logging.getLogger("hfapi.watcher")
 
 Callback = Callable[[dict], Awaitable[None]]
 
+# Views must jump this much in a single poll cycle to fire thread_view_spike.
+_VIEW_SPIKE_THRESHOLD = 500
+
 
 # ── Watch job dataclasses ──────────────────────────────────────────────────────
 
@@ -33,9 +31,17 @@ Callback = Callable[[dict], Awaitable[None]]
 class _ThreadWatch:
     tid:      int
     callback: Callback
-    interval: int   = 60
-    _last_post: int = field(default=0, init=False, repr=False)
-    _seen_pids: set = field(default_factory=set, init=False, repr=False)
+    interval: int = 60
+    my_uid:   str = ""   # token owner UID — if set, skips post fetch when we were last poster
+
+    # Internal poll state
+    _last_post:      int = field(default=0,   init=False, repr=False)
+    _num_replies:    int = field(default=0,   init=False, repr=False)  # Bug #3: edit detection
+    _lastposteruid:  str = field(default="",  init=False, repr=False)  # Bug #1
+    _bestpid:        str = field(default="",  init=False, repr=False)  # best answer tracking
+    _views:          int = field(default=0,   init=False, repr=False)  # view spike tracking
+    _closed:         str = field(default="",  init=False, repr=False)  # closed detection
+    _seen_pids:      set = field(default_factory=set, init=False, repr=False)
 
 
 @dataclass
@@ -90,6 +96,12 @@ class HFWatcher:
     Args:
         client:    An HFClient instance (already has your token + proxy).
         on_error:  Optional async callback fired when a poll cycle raises.
+
+    IMPORTANT — owner-scoped endpoints:
+        The contracts, disputes, and bratings endpoints only return data for
+        the token's own authenticated user. This watcher's watch_bytes() uses
+        the token owner's UID automatically. There is no way to watch another
+        user's contracts or bytes with your own token.
     """
 
     def __init__(self, client: HFClient, on_error: Callback | None = None):
@@ -105,8 +117,45 @@ class HFWatcher:
 
     # ── Registration API ───────────────────────────────────────────────────────
 
-    def watch_thread(self, tid: int, callback: Callback, interval: int = 60) -> "HFWatcher":
-        self._thread_watches.append(_ThreadWatch(tid=tid, callback=callback, interval=interval))
+    def watch_thread(
+        self,
+        tid: int,
+        callback: Callback,
+        interval: int = 60,
+        my_uid: str = "",
+    ) -> "HFWatcher":
+        """
+        Watch a thread for new replies.
+
+        Args:
+            tid:      Thread ID to watch.
+            callback: Async function called on new reply/event.
+            interval: Poll interval in seconds (default 60).
+            my_uid:   Token owner's HF UID as a string. When provided, the
+                      watcher skips the posts fetch on cycles where the last
+                      poster was you — saves one API call per self-post.
+
+        Callback receives one of these event dicts depending on what changed:
+
+            thread_reply:
+                { "event": "thread_reply", "tid": int, "pid": int|None,
+                  "uid": str, "username": str, "subject": str,
+                  "snippet": str, "dateline": int }
+
+            thread_best_answer  (zero extra API cost):
+                { "event": "thread_best_answer", "tid": int,
+                  "pid": str, "subject": str }
+
+            thread_view_spike  (zero extra API cost):
+                { "event": "thread_view_spike", "tid": int, "subject": str,
+                  "spike": int, "views": int }
+
+            thread_closed  (zero extra API cost):
+                { "event": "thread_closed", "tid": int, "subject": str }
+        """
+        self._thread_watches.append(
+            _ThreadWatch(tid=tid, callback=callback, interval=interval, my_uid=my_uid)
+        )
         return self
 
     def watch_forum(self, fid: int, callback: Callback, interval: int = 120) -> "HFWatcher":
@@ -195,15 +244,23 @@ class HFWatcher:
             await asyncio.sleep(w.interval)
 
     async def _poll_thread(self, w: _ThreadWatch) -> None:
+        # Bug #1 fix: added lastposteruid (was missing — caused redundant post fetches).
+        # Also added views, bestpid, closed for zero-cost event detection.
         meta = await self._hf.read({
             "threads": {
-                "_tid":       [w.tid],
-                "tid":        True,
-                "subject":    True,
-                "lastpost":   True,
-                "numreplies": True,
+                "_tid":          [w.tid],
+                "tid":           True,
+                "subject":       True,
+                "lastpost":      True,
+                "lastposteruid": True,   # Bug #1 fix: skip fetch when we were last poster
+                "lastposter":    True,   # free username string, no extra cost
+                "numreplies":    True,
+                "views":         True,   # NEW: view spike detection
+                "bestpid":       True,   # NEW: best answer detection
+                "closed":        True,   # NEW: thread closed detection
             }
         })
+
         if not meta or "threads" not in meta:
             return
 
@@ -211,20 +268,85 @@ class HFWatcher:
         if isinstance(threads, dict):
             threads = [threads]
         if not threads:
+            log.info(f"watch_thread tid={w.tid} — thread absent from response (deleted/private/moved)")
             return
 
-        t          = threads[0]
-        lastpost   = int(t.get("lastpost") or 0)
-        numreplies = int(t.get("numreplies") or 0)
-        subject    = t.get("subject", "Thread")
+        t             = threads[0]
+        lastpost      = int(t.get("lastpost") or 0)
+        numreplies    = int(t.get("numreplies") or 0)
+        lastposteruid = str(t.get("lastposteruid") or "")
+        lastposter    = t.get("lastposter") or ""
+        subject       = t.get("subject", "Thread")
+        bestpid       = str(t.get("bestpid") or "")
+        views         = int(t.get("views") or 0)
+        closed        = str(t.get("closed") or "")
 
+        # ── Seed on first poll — don't fire for existing state ─────────────────
         if w._last_post == 0:
-            w._last_post = lastpost
+            w._last_post     = lastpost
+            w._num_replies   = numreplies
+            w._lastposteruid = lastposteruid
+            w._bestpid       = bestpid
+            w._views         = views
+            w._closed        = closed
             return
 
+        # ── NEW: Best answer marked ───────────────────────────────────────────
+        # bestpid changes when someone votes a post as the best answer.
+        # "0" means no best answer set — ignore that transition.
+        if bestpid and bestpid != "0" and bestpid != w._bestpid and w._bestpid != "":
+            await w.callback({
+                "event":   "thread_best_answer",
+                "tid":     w.tid,
+                "pid":     bestpid,
+                "subject": subject,
+            })
+            log.debug(f"watch_thread tid={w.tid}: best answer set pid={bestpid}")
+        w._bestpid = bestpid
+
+        # ── NEW: View spike ───────────────────────────────────────────────────
+        if w._views > 0 and views > 0 and (views - w._views) >= _VIEW_SPIKE_THRESHOLD:
+            await w.callback({
+                "event":   "thread_view_spike",
+                "tid":     w.tid,
+                "subject": subject,
+                "spike":   views - w._views,
+                "views":   views,
+            })
+            log.debug(f"watch_thread tid={w.tid}: view spike +{views - w._views}")
+        w._views = views
+
+        # ── NEW: Thread closed ────────────────────────────────────────────────
+        if closed == "1" and w._closed != "1":
+            await w.callback({
+                "event":   "thread_closed",
+                "tid":     w.tid,
+                "subject": subject,
+            })
+            log.debug(f"watch_thread tid={w.tid}: thread closed")
+        w._closed = closed
+
+        # ── No new post — nothing more to do ─────────────────────────────────
         if lastpost <= w._last_post:
             return
 
+        # ── Bug #1 fix: skip post fetch when token owner was last poster ──────
+        if w.my_uid and lastposteruid == w.my_uid:
+            log.debug(f"watch_thread tid={w.tid}: last poster is us ({w.my_uid}), skipping post fetch")
+            w._last_post     = lastpost
+            w._num_replies   = numreplies
+            w._lastposteruid = lastposteruid
+            return
+
+        # ── Bug #3 fix: skip post fetch when numreplies unchanged (it's an edit)
+        # lastpost updates on edits too, but numreplies does not.
+        if w._num_replies > 0 and numreplies == w._num_replies:
+            log.debug(f"watch_thread tid={w.tid}: numreplies={numreplies} unchanged — edit, skipping post fetch")
+            w._last_post     = lastpost
+            w._lastposteruid = lastposteruid
+            return
+
+        # ── Fetch newest posts ────────────────────────────────────────────────
         last_page = max(1, (numreplies + 1 + 9) // 10)
         post_data = await self._hf.read({
             "posts": {
@@ -233,21 +355,29 @@ class HFWatcher:
                 "_perpage": 10,
                 "pid":      True,
                 "uid":      True,
+                "username": True,   # Bug #2 fix: was missing, free inline field
                 "dateline": True,
                 "message":  True,
             }
         })
+
+        w._last_post     = lastpost
+        w._num_replies   = numreplies
+        w._lastposteruid = lastposteruid
+
         if not post_data or "posts" not in post_data:
+            # Couldn't fetch posts — still fire a minimal reply event so caller
+            # isn't completely dark. uid/username/snippet are unknown.
             await w.callback({
                 "event":    "thread_reply",
                 "tid":      w.tid,
                 "pid":      None,
-                "uid":      None,
+                "uid":      lastposteruid,
+                "username": lastposter,
                 "subject":  subject,
                 "snippet":  "",
                 "dateline": lastpost,
             })
-            w._last_post = lastpost
             return
 
         posts = post_data["posts"]
@@ -260,7 +390,8 @@ class HFWatcher:
             pid      = int(post.get("pid") or 0)
             dateline = int(post.get("dateline") or 0)
 
-            if dateline <= w._last_post:
+            if dateline <= w._last_post - (lastpost - w._last_post):
+                # Older than the window we care about
                 continue
             if pid in w._seen_pids:
                 continue
@@ -271,12 +402,12 @@ class HFWatcher:
                 "tid":      w.tid,
                 "pid":      pid,
                 "uid":      str(post.get("uid", "")),
+                "username": post.get("username") or lastposter,   # Bug #2 fix
                 "subject":  subject,
                 "snippet":  _strip_bbcode(post.get("message", ""))[:200],
                 "dateline": dateline,
             })
 
-        w._last_post = lastpost
         if len(w._seen_pids) > 500:
             w._seen_pids = set(list(w._seen_pids)[-250:])
 
@@ -293,11 +424,16 @@ class HFWatcher:
     async def _poll_forum(self, w: _ForumWatch) -> None:
         data = await self._hf.read({
             "threads": {
-                "_fid":     [w.fid],
-                "tid":      True,
-                "uid":      True,
-                "subject":  True,
-                "dateline": True,
+                "_fid":      [w.fid],
+                "_page":     1,
+                "_perpage":  20,
+                "tid":       True,
+                "uid":       True,
+                "subject":   True,
+                "dateline":  True,
+                "lastpost":  True,
+                "username":  True,
+                "firstpost": True,
             }
         })
         if not data or "threads" not in data:
@@ -307,19 +443,17 @@ class HFWatcher:
         if isinstance(threads, dict):
             threads = [threads]
 
-        if not w._initialized:
-            for t in (threads or []):
-                tid = int(t.get("tid") or 0)
-                if tid:
-                    w._seen_tids.add(tid)
-            w._initialized = True
-            return
-
         for t in sorted(threads or [], key=lambda x: int(x.get("dateline") or 0)):
             tid      = int(t.get("tid") or 0)
             dateline = int(t.get("dateline") or 0)
+
             if not tid or tid in w._seen_tids:
                 continue
+
+            if not w._initialized:
+                w._seen_tids.add(tid)
+                continue
+
             w._seen_tids.add(tid)
             await w.callback({
                 "event":    "new_thread",
@@ -330,8 +464,10 @@ class HFWatcher:
                 "dateline": dateline,
             })
 
-        if len(w._seen_tids) > 1000:
-            w._seen_tids = set(list(w._seen_tids)[-500:])
+        w._initialized = True
+
+        if len(w._seen_tids) > 2000:
+            w._seen_tids = set(list(w._seen_tids)[-1000:])
 
     async def _user_loop(self, w: _UserWatch) -> None:
         while self._running:
@@ -358,25 +494,24 @@ class HFWatcher:
             rows = thread_data["threads"]
             if isinstance(rows, dict):
                 rows = [rows]
-            if not w._initialized:
-                for t in (rows or []):
-                    tid = int(t.get("tid") or 0)
-                    if tid:
-                        w._seen_tids.add(tid)
-            else:
-                for t in sorted(rows or [], key=lambda x: int(x.get("dateline") or 0)):
-                    tid      = int(t.get("tid") or 0)
-                    dateline = int(t.get("dateline") or 0)
-                    if not tid or tid in w._seen_tids:
-                        continue
+            for t in sorted(rows or [], key=lambda x: int(x.get("dateline") or 0)):
+                tid      = int(t.get("tid") or 0)
+                dateline = int(t.get("dateline") or 0)
+                if not tid:
+                    continue
+                if not w._initialized:
                     w._seen_tids.add(tid)
-                    await w.callback({
-                        "event":    "user_thread",
-                        "uid":      w.uid,
-                        "tid":      tid,
-                        "subject":  t.get("subject", ""),
-                        "dateline": dateline,
-                    })
+                    continue
+                if tid in w._seen_tids:
+                    continue
+                w._seen_tids.add(tid)
+                await w.callback({
+                    "event":    "user_thread",
+                    "uid":      w.uid,
+                    "tid":      tid,
+                    "subject":  t.get("subject", ""),
+                    "dateline": dateline,
+                })
 
         if w.mode == "all":
             post_data = await self._hf.read({
@@ -395,8 +530,7 @@ class HFWatcher:
                 posts = post_data["posts"]
                 if isinstance(posts, dict):
                     posts = [posts]
-                posts_sorted = sorted(posts or [], key=lambda p: int(p.get("dateline") or 0))
-                for p in posts_sorted:
+                for p in sorted(posts or [], key=lambda p: int(p.get("dateline") or 0)):
                     pid      = int(p.get("pid") or 0)
                     dateline = int(p.get("dateline") or 0)
                     if not pid:
@@ -435,18 +569,14 @@ class HFWatcher:
             await asyncio.sleep(w.interval)
 
     async def _poll_keyword(self, w: _KeywordWatch) -> None:
-        # Bug #6 fix: use w._seen_tids for thread IDs and w._seen_pids for post IDs
-        fids = w.fids if w.fids else []
-        if not fids:
-            log.warning("watch_keyword: no fids specified — keyword watching requires at least one forum ID")
-            return
-
+        fids = w.fids or []
         for fid in fids:
             data = await self._hf.read({
                 "threads": {
                     "_fid":     [fid],
+                    "_page":    1,
+                    "_perpage": 20,
                     "tid":      True,
-                    "uid":      True,
                     "subject":  True,
                     "dateline": True,
                 }
@@ -459,34 +589,15 @@ class HFWatcher:
                 threads = [threads]
 
             for t in (threads or []):
-                tid      = int(t.get("tid") or 0)
-                subject  = t.get("subject", "")
-                dateline = int(t.get("dateline") or 0)
-
-                if not tid or tid in w._seen_tids:
+                tid     = int(t.get("tid") or 0)
+                subject = t.get("subject", "")
+                if not tid:
                     continue
 
-                # Check subject match
-                if w.pattern.search(subject):
-                    w._seen_tids.add(tid)
-                    await w.callback({
-                        "event":    "keyword_match",
-                        "keyword":  w.pattern.pattern,
-                        "fid":      fid,
-                        "tid":      tid,
-                        "pid":      None,
-                        "subject":  subject,
-                        "snippet":  subject,
-                        "dateline": dateline,
-                    })
+                # Bug #6 fix: check _seen_tids (not _seen_pids) for thread IDs
+                if tid in w._seen_tids:
                     continue
 
-                # Skip old threads for content scanning
-                if time.time() - dateline > 3600:
-                    w._seen_tids.add(tid)
-                    continue
-
-                # Check post content for recent threads
                 post_data = await self._hf.read({
                     "posts": {
                         "_tid":     [tid],
@@ -523,7 +634,6 @@ class HFWatcher:
                         })
                 w._seen_tids.add(tid)
 
-        # Bound both sets
         if len(w._seen_tids) > 2000:
             w._seen_tids = set(list(w._seen_tids)[-1000:])
         if len(w._seen_pids) > 2000:
@@ -542,31 +652,28 @@ class HFWatcher:
     async def _poll_bytes(self, w: _BytesWatch) -> None:
         # Bug #4 fix: _my_uid is scoped to the _BytesWatch dataclass, not self.
         # None = not yet fetched (retry next poll).
-        # A valid UID is cached after first successful fetch.
-        # If the API returns a missing/empty uid we leave it as None and retry
-        # next poll — we do NOT set it to 0 and permanently kill the watcher.
         if w._my_uid is None:
-            me = await self._hf.read({"me": {"uid": True}})
-            if not me or "me" not in me:
-                return   # transient failure — retry next poll
-            me_data = me["me"]
-            if isinstance(me_data, list):
-                me_data = me_data[0] if me_data else {}
-            uid_val = int(me_data.get("uid") or 0)
-            if not uid_val:
-                # uid came back empty — transient or bad response, retry next poll
-                log.warning("watch_bytes: /me returned empty uid, will retry next poll")
+            me_data = await self._hf.read({"me": {"uid": True}})
+            if not me_data or "me" not in me_data:
                 return
-            w._my_uid = uid_val
+            me = me_data["me"]
+            if isinstance(me, list):
+                me = me[0] if me else {}
+            uid = int(me.get("uid") or 0)
+            if not uid:
+                # Transient failure — leave as None and retry next poll.
+                # Bug #4: old code set this to 0 and permanently killed the watcher.
+                return
+            w._my_uid = uid
 
         data = await self._hf.read({
             "bytes": {
                 "_to":      [w._my_uid],
-                "_perpage": 20,
+                "_perpage": 10,
                 "id":       True,
                 "amount":   True,
-                "dateline": True,
                 "reason":   True,
+                "dateline": True,
                 "from":     True,
             }
         })
@@ -577,37 +684,35 @@ class HFWatcher:
         if isinstance(txs, dict):
             txs = [txs]
 
-        if not w._initialized:
-            for tx in (txs or []):
-                txid = str(tx.get("id", ""))
-                if txid:
-                    w._seen_ids.add(txid)
-            w._initialized = True
-            return
-
         for tx in sorted(txs or [], key=lambda x: int(x.get("dateline") or 0)):
-            txid = str(tx.get("id", ""))
-            if not txid or txid in w._seen_ids:
+            txid = str(tx.get("id") or "")
+            if not txid:
                 continue
+            if not w._initialized:
+                w._seen_ids.add(txid)
+                continue
+            if txid in w._seen_ids:
+                continue
+
             w._seen_ids.add(txid)
-            from_data = tx.get("from") or {}
-            if isinstance(from_data, list) and from_data:
-                from_data = from_data[0]
-            from_user = from_data.get("username", "") if isinstance(from_data, dict) else ""
             await w.callback({
                 "event":     "bytes_received",
                 "id":        txid,
                 "amount":    float(tx.get("amount") or 0),
-                "reason":    tx.get("reason", ""),
-                "from_user": from_user,
+                "reason":    tx.get("reason") or "",
+                "from_user": str(tx.get("from") or ""),
                 "dateline":  int(tx.get("dateline") or 0),
             })
+
+        w._initialized = True
+
+        if len(w._seen_ids) > 500:
+            w._seen_ids = set(list(w._seen_ids)[-250:])
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _strip_bbcode(text: str) -> str:
-    """Remove BBCode tags and collapse whitespace."""
-    import re as _re
-    text = _re.sub(r'\[/?[a-zA-Z][^\]]*\]', '', text)
-    return _re.sub(r'\s+', ' ', text).strip()
+    """Strip BBCode tags and collapse whitespace."""
+    text = re.sub(r"\[/?[a-zA-Z][^\]]*\]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
