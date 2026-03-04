@@ -105,9 +105,6 @@ class HFContracts(HFClient):
         Use this when you have the UID already and want to be explicit.
         The uid MUST be the token owner's UID — passing any other UID
         returns empty results silently.
-
-        This is what the bot uses: it always passes my_uid (its own UID from
-        the me endpoint) to make the intent clear in the call site.
         """
         data = self.read_sync({"contracts": {
             "_uid":     [uid],
@@ -152,12 +149,6 @@ class HFContracts(HFClient):
 
         Includes inituser, otheruser, escrow (user objects), thread (linked
         thread), and ibrating/obrating (b-ratings) inline.
-
-        Note on disputes: the contracts endpoint does accept idispute/odispute
-        as sub-field lists in the asks dict (matching the disputes endpoint
-        schema), but this has not been verified against a live active dispute.
-        Use HFDisputes.get_by_contracts([cid]) to fetch dispute data reliably
-        until that behaviour is confirmed.
         """
         rows = self.get([cid], fields={
             **_FIELDS,
@@ -170,6 +161,8 @@ class HFContracts(HFClient):
             "obrating":    ["crid", "amount", "message", "fromid", "dateline"],
         })
         return rows[0] if rows else None
+
+    # ── Filter helpers (all OWNER-SCOPED) ─────────────────────────────────────
 
     def get_active_mine(self, max_pages: int = 10) -> list[dict]:
         """
@@ -214,7 +207,7 @@ class HFContracts(HFClient):
 
     def get_incomplete(self, uid: int, max_pages: int = 10) -> list[dict]:
         """
-        Get incomplete contracts.
+        Get incomplete (timed-out) contracts.
 
         OWNER-SCOPED: uid must be the token owner's own UID.
         """
@@ -223,11 +216,98 @@ class HFContracts(HFClient):
             if str(c.get("status", "")).lower() == "incomplete"
         ]
 
+    def get_cancelled(self, uid: int, max_pages: int = 10) -> list[dict]:
+        """
+        Get cancelled contracts.
+
+        OWNER-SCOPED: uid must be the token owner's own UID.
+
+
+        """
+        return [
+            c for c in self.get_all_by_user(uid, max_pages=max_pages)
+            if str(c.get("status", "")).lower() == "cancelled"
+        ]
+
+    def get_cancelled_mine(self, max_pages: int = 10) -> list[dict]:
+        """Get cancelled contracts for the token owner."""
+        return [
+            c for c in self.get_all_mine(max_pages=max_pages)
+            if str(c.get("status", "")).lower() == "cancelled"
+        ]
+
+    def get_disputed(self, uid: int, max_pages: int = 10) -> list[dict]:
+        """
+        Get contracts that have an open dispute.
+
+        OWNER-SCOPED: uid must be the token owner's own UID.
+
+
+        Implementation: fetches all contracts, then queries the disputes
+        endpoint for those contract IDs.  Returns only the subset of
+        contracts that have at least one dispute record.  Adds one extra
+        API call but is the only reliable way to detect disputes without
+        fetching nested dispute sub-objects on every contract page.
+
+        Note: disputes can exist on contracts of any status, including
+        complete and cancelled.
+        """
+        contracts = self.get_all_by_user(uid, max_pages=max_pages)
+        if not contracts:
+            return []
+        cids = [int(c["cid"]) for c in contracts if c.get("cid")]
+        if not cids:
+            return []
+        from HFDisputes import HFDisputes
+        dispute_rows = HFDisputes(self.token, proxy=self.proxy).get_by_contracts(cids)
+        disputed_cids = {str(d.get("contractid")) for d in dispute_rows if d.get("contractid")}
+        return [c for c in contracts if str(c.get("cid")) in disputed_cids]
+
+    def get_cancellation_requested(self, uid: int, max_pages: int = 10) -> list[dict]:
+        """
+        Get contracts where a cancellation has been requested but not yet resolved.
+
+        OWNER-SCOPED: uid must be the token owner's own UID.
+
+        """
+        return [
+            c for c in self.get_all_by_user(uid, max_pages=max_pages)
+            if _is_set(c.get("cancelstatus"))
+        ]
+
+    def get_middleman_contracts(self, uid: int, max_pages: int = 10) -> list[dict]:
+        """
+        Get contracts that involve a middleman/escrow (muid is set).
+
+        OWNER-SCOPED: uid must be the token owner's own UID.
+
+        """
+        return [
+            c for c in self.get_all_by_user(uid, max_pages=max_pages)
+            if _is_set(c.get("muid"))
+        ]
+
+    def get_by_type(self, uid: int, ctype: str, max_pages: int = 10) -> list[dict]:
+        """
+        Get contracts filtered by the initiator's position type.
+
+        Args:
+            uid:   Token owner's UID (OWNER-SCOPED).
+            ctype: One of: buying, selling, exchanging, trading, vouch_copy.
+
+        """
+        target = ctype.lower().strip()
+        return [
+            c for c in self.get_all_by_user(uid, max_pages=max_pages)
+            if str(c.get("type", "")).lower() == target
+        ]
+
     def get_summary(self, uid: int, max_pages: int = 50) -> dict:
         """
         Return a statistical summary of all contracts for the token owner.
 
         OWNER-SCOPED: uid must be the token owner's own UID.
+
 
         Returns:
             {
@@ -242,7 +322,7 @@ class HFContracts(HFClient):
         contracts = self.get_all_by_user(uid, max_pages=max_pages)
         by_status: dict[str, int] = {}
         by_type:   dict[str, int] = {}
-        middleman = disputed = cancel_pending = 0
+        middleman = cancel_pending = 0
 
         for c in contracts:
             status = str(c.get("status", "unknown")).lower()
@@ -251,8 +331,23 @@ class HFContracts(HFClient):
             by_type[ctype]    = by_type.get(ctype, 0) + 1
             if _is_set(c.get("muid")):
                 middleman += 1
-            if str(c.get("cancelstatus", "")).lower() not in ("", "0", "none"):
+            if _is_set(c.get("cancelstatus")):
                 cancel_pending += 1
+
+        # BUG FIX: count disputed contracts via the disputes endpoint.
+        # Standard contract fetches don't include nested dispute objects,
+        # so we need a separate query.  Returns 0 gracefully if the call fails.
+        disputed = 0
+        if contracts:
+            cids = [int(c["cid"]) for c in contracts if c.get("cid")]
+            try:
+                from HFDisputes import HFDisputes
+                dispute_rows = HFDisputes(self.token, proxy=self.proxy).get_by_contracts(cids)
+                # Count distinct disputed contracts (not number of disputes)
+                disputed_cids = {str(d.get("contractid")) for d in dispute_rows if d.get("contractid")}
+                disputed = len(disputed_cids)
+            except Exception:
+                pass  # disputes endpoint may 503 — don't crash the summary
 
         return {
             "total":                len(contracts),
