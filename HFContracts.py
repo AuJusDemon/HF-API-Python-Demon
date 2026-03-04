@@ -1,7 +1,6 @@
 """
 HFContracts — read contract data from HackForums.
 Requires 'Contracts' scope.
-
 """
 
 from HFClient import HFClient
@@ -58,53 +57,33 @@ class HFContracts(HFClient):
     """
     Read contract data (/read/contracts endpoint).
 
-    OWNER-SCOPED: All _uid queries on the contracts endpoint only return
-    contracts for the authenticated token's user. You cannot read another
-    user's contracts with your token — use get_mine() (not get_by_user with
-    a third-party UID). If you need another user's data, they must OAuth
-    and you must use their token.
+    OWNER-SCOPED: The contracts endpoint only returns contracts for the
+    authenticated token's own user. You cannot read another user's contracts
+    with your token. If you need another user's data, they must OAuth and
+    you must use their token.
     """
 
     def get(self, cids: list[int], fields: dict = None) -> list[dict]:
         """
         Get contracts by specific contract ID(s).
 
-        This is the only way to look up a contract you are NOT a party to —
+        This is the only way to look up a contract you are NOT a party to,
         but only if the contract is public. Private contracts by CID that
         don't involve you will return empty.
         """
         data = self.read_sync({"contracts": {"_cid": cids, **(fields or _FIELDS)}})
         return self._unwrap(data, "contracts")
 
-    def get_mine(self, page: int = 1, perpage: int = 30) -> list[dict]:
+    def get_mine(self, uid: int, page: int = 1, perpage: int = 30) -> list[dict]:
         """
-        Get contracts for the authenticated token owner (page by page).
+        Get contracts for the authenticated token owner (single page).
 
-        OWNER-SCOPED: Only returns contracts involving the token's own user.
-        There is no way to retrieve another user's contracts with your token.
+        OWNER-SCOPED: uid must be your own UID from the me endpoint.
 
         Args:
+            uid:     Your UID.
             page:    Page number (default 1).
             perpage: Results per page (default 30, max 30).
-
-        Returns:
-            List of contract dicts. Empty if no contracts or token mismatch.
-        """
-        data = self.read_sync({"contracts": {
-            "_uid":     [0],   # 0 = "me" — HF ignores the value, uses the token
-            "_page":    page,
-            "_perpage": perpage,
-            **_FIELDS,
-        }})
-        return self._unwrap(data, "contracts")
-
-    def get_mine_with_uid(self, uid: int, page: int = 1, perpage: int = 30) -> list[dict]:
-        """
-        Get contracts, explicitly passing the token owner's own UID.
-
-        Use this when you have the UID already and want to be explicit.
-        The uid MUST be the token owner's UID — passing any other UID
-        returns empty results silently.
         """
         data = self.read_sync({"contracts": {
             "_uid":     [uid],
@@ -114,34 +93,22 @@ class HFContracts(HFClient):
         }})
         return self._unwrap(data, "contracts")
 
-    # ── Deprecated name — kept as alias so old callers don't break ────────────
     def get_by_user(self, uid: int, page: int = 1, perpage: int = 30) -> list[dict]:
-        """
-        DEPRECATED — renamed to get_mine_with_uid().
+        """Alias for get_mine(). uid must be the token owner's own UID."""
+        return self.get_mine(uid, page, perpage)
 
-        OWNER-SCOPED: Despite the name, the uid here MUST be the token
-        owner's own UID. Passing a third-party UID returns nothing.
-        Use get_mine() or get_mine_with_uid(my_uid) instead.
-        """
-        return self.get_mine_with_uid(uid, page, perpage)
-
-    def get_all_mine(self, perpage: int = 30, max_pages: int = 50) -> list[dict]:
+    def get_all_mine(self, uid: int, perpage: int = 30, max_pages: int = 50) -> list[dict]:
         """
         Get ALL contracts for the authenticated token owner, auto-paginating.
 
-        OWNER-SCOPED: Only returns contracts involving the token's own user.
-        """
-        from HFPaginator import HFPaginator
-        return HFPaginator.get_all_contracts_by_user(self, 0, perpage, max_pages)
-
-    def get_all_by_user(self, uid: int, perpage: int = 30, max_pages: int = 50) -> list[dict]:
-        """
-        DEPRECATED — renamed to get_all_mine().
-
-        OWNER-SCOPED: uid must be the token owner's own UID.
+        OWNER-SCOPED: uid must be your own UID from the me endpoint.
         """
         from HFPaginator import HFPaginator
         return HFPaginator.get_all_contracts_by_user(self, uid, perpage, max_pages)
+
+    def get_all_by_user(self, uid: int, perpage: int = 30, max_pages: int = 50) -> list[dict]:
+        """Alias for get_all_mine(). uid must be the token owner's own UID."""
+        return self.get_all_mine(uid, perpage, max_pages)
 
     def get_full(self, cid: int) -> dict | None:
         """
@@ -164,30 +131,26 @@ class HFContracts(HFClient):
 
     # ── Filter helpers (all OWNER-SCOPED) ─────────────────────────────────────
 
-    def get_active_mine(self, max_pages: int = 10) -> list[dict]:
+    def get_active(self, uid: int, max_pages: int = 10) -> list[dict]:
         """
-        Get active contracts for the token owner (status not cancelled/complete/incomplete).
+        Get active contracts (status not cancelled/complete/incomplete).
 
-        OWNER-SCOPED: Only returns your own contracts.
+        OWNER-SCOPED: uid must be your own UID.
         """
         inactive = {"cancelled", "complete", "incomplete"}
         return [
-            c for c in self.get_all_mine(max_pages=max_pages)
+            c for c in self.get_all_mine(uid, max_pages=max_pages)
             if str(c.get("status", "")).lower() not in inactive
         ]
-
-    def get_active(self, uid: int, max_pages: int = 10) -> list[dict]:
-        """DEPRECATED — renamed to get_active_mine(). uid must be token owner's UID."""
-        return self.get_active_mine(max_pages=max_pages)
 
     def get_pending(self, uid: int, max_pages: int = 10) -> list[dict]:
         """
         Get contracts where istatus or ostatus is 'pending'.
 
-        OWNER-SCOPED: uid must be the token owner's own UID.
+        OWNER-SCOPED: uid must be your own UID.
         """
         return [
-            c for c in self.get_all_by_user(uid, max_pages=max_pages)
+            c for c in self.get_all_mine(uid, max_pages=max_pages)
             if (
                 str(c.get("istatus", "")).lower() == "pending"
                 or str(c.get("ostatus", "")).lower() == "pending"
@@ -198,10 +161,10 @@ class HFContracts(HFClient):
         """
         Get completed contracts.
 
-        OWNER-SCOPED: uid must be the token owner's own UID.
+        OWNER-SCOPED: uid must be your own UID.
         """
         return [
-            c for c in self.get_all_by_user(uid, max_pages=max_pages)
+            c for c in self.get_all_mine(uid, max_pages=max_pages)
             if str(c.get("status", "")).lower() == "complete"
         ]
 
@@ -209,10 +172,10 @@ class HFContracts(HFClient):
         """
         Get incomplete (timed-out) contracts.
 
-        OWNER-SCOPED: uid must be the token owner's own UID.
+        OWNER-SCOPED: uid must be your own UID.
         """
         return [
-            c for c in self.get_all_by_user(uid, max_pages=max_pages)
+            c for c in self.get_all_mine(uid, max_pages=max_pages)
             if str(c.get("status", "")).lower() == "incomplete"
         ]
 
@@ -220,39 +183,25 @@ class HFContracts(HFClient):
         """
         Get cancelled contracts.
 
-        OWNER-SCOPED: uid must be the token owner's own UID.
-
-
+        OWNER-SCOPED: uid must be your own UID.
         """
         return [
-            c for c in self.get_all_by_user(uid, max_pages=max_pages)
-            if str(c.get("status", "")).lower() == "cancelled"
-        ]
-
-    def get_cancelled_mine(self, max_pages: int = 10) -> list[dict]:
-        """Get cancelled contracts for the token owner."""
-        return [
-            c for c in self.get_all_mine(max_pages=max_pages)
+            c for c in self.get_all_mine(uid, max_pages=max_pages)
             if str(c.get("status", "")).lower() == "cancelled"
         ]
 
     def get_disputed(self, uid: int, max_pages: int = 10) -> list[dict]:
         """
-        Get contracts that have an open dispute.
+        Get contracts that have a dispute.
 
-        OWNER-SCOPED: uid must be the token owner's own UID.
+        OWNER-SCOPED: uid must be your own UID.
 
-
-        Implementation: fetches all contracts, then queries the disputes
-        endpoint for those contract IDs.  Returns only the subset of
-        contracts that have at least one dispute record.  Adds one extra
-        API call but is the only reliable way to detect disputes without
-        fetching nested dispute sub-objects on every contract page.
-
-        Note: disputes can exist on contracts of any status, including
-        complete and cancelled.
+        Fetches all contracts then queries the disputes endpoint for those
+        contract IDs. Returns only contracts with at least one dispute record.
+        Disputes can exist on contracts of any status, including complete and
+        cancelled.
         """
-        contracts = self.get_all_by_user(uid, max_pages=max_pages)
+        contracts = self.get_all_mine(uid, max_pages=max_pages)
         if not contracts:
             return []
         cids = [int(c["cid"]) for c in contracts if c.get("cid")]
@@ -267,11 +216,10 @@ class HFContracts(HFClient):
         """
         Get contracts where a cancellation has been requested but not yet resolved.
 
-        OWNER-SCOPED: uid must be the token owner's own UID.
-
+        OWNER-SCOPED: uid must be your own UID.
         """
         return [
-            c for c in self.get_all_by_user(uid, max_pages=max_pages)
+            c for c in self.get_all_mine(uid, max_pages=max_pages)
             if _is_set(c.get("cancelstatus"))
         ]
 
@@ -279,11 +227,10 @@ class HFContracts(HFClient):
         """
         Get contracts that involve a middleman/escrow (muid is set).
 
-        OWNER-SCOPED: uid must be the token owner's own UID.
-
+        OWNER-SCOPED: uid must be your own UID.
         """
         return [
-            c for c in self.get_all_by_user(uid, max_pages=max_pages)
+            c for c in self.get_all_mine(uid, max_pages=max_pages)
             if _is_set(c.get("muid"))
         ]
 
@@ -292,13 +239,12 @@ class HFContracts(HFClient):
         Get contracts filtered by the initiator's position type.
 
         Args:
-            uid:   Token owner's UID (OWNER-SCOPED).
+            uid:   Your UID (OWNER-SCOPED).
             ctype: One of: buying, selling, exchanging, trading, vouch_copy.
-
         """
         target = ctype.lower().strip()
         return [
-            c for c in self.get_all_by_user(uid, max_pages=max_pages)
+            c for c in self.get_all_mine(uid, max_pages=max_pages)
             if str(c.get("type", "")).lower() == target
         ]
 
@@ -306,20 +252,22 @@ class HFContracts(HFClient):
         """
         Return a statistical summary of all contracts for the token owner.
 
-        OWNER-SCOPED: uid must be the token owner's own UID.
+        OWNER-SCOPED: uid must be your own UID.
 
+        Queries the disputes endpoint separately to get an accurate disputed
+        count. Returns disputed=0 gracefully if the disputes call fails.
 
         Returns:
             {
               "total":                int,
               "by_status":            {"active": N, "complete": N, ...},
               "by_type":              {"standard": N, ...},
-              "middleman":            int,   # contracts with a middleman
+              "middleman":            int,
               "disputed":             int,
               "cancellation_pending": int,
             }
         """
-        contracts = self.get_all_by_user(uid, max_pages=max_pages)
+        contracts = self.get_all_mine(uid, max_pages=max_pages)
         by_status: dict[str, int] = {}
         by_type:   dict[str, int] = {}
         middleman = cancel_pending = 0
@@ -334,20 +282,16 @@ class HFContracts(HFClient):
             if _is_set(c.get("cancelstatus")):
                 cancel_pending += 1
 
-        # BUG FIX: count disputed contracts via the disputes endpoint.
-        # Standard contract fetches don't include nested dispute objects,
-        # so we need a separate query.  Returns 0 gracefully if the call fails.
         disputed = 0
         if contracts:
             cids = [int(c["cid"]) for c in contracts if c.get("cid")]
             try:
                 from HFDisputes import HFDisputes
                 dispute_rows = HFDisputes(self.token, proxy=self.proxy).get_by_contracts(cids)
-                # Count distinct disputed contracts (not number of disputes)
                 disputed_cids = {str(d.get("contractid")) for d in dispute_rows if d.get("contractid")}
                 disputed = len(disputed_cids)
             except Exception:
-                pass  # disputes endpoint may 503 — don't crash the summary
+                pass
 
         return {
             "total":                len(contracts),
