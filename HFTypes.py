@@ -26,33 +26,47 @@ from typing import TypedDict, NotRequired
 class HFMe(TypedDict):
     """
     /read/me response. Requires 'Basic Info' scope.
-    Advanced fields require 'Advanced Info' scope.
+    Advanced fields (unreadpms, invisible, totalpms, warningpoints, lastactive)
+    require 'Advanced Info' scope.
+
+    IMPORTANT — bytes vs myps:
+        On the me endpoint, your byte balance is returned as the field "bytes".
+        On the users endpoint, the same value is returned as "myps".
+        These are two different field names for the same concept — do NOT
+        use "myps" when reading from a me response, it will always be None.
+
+        Correct:
+            me_data = hf.read({"me": {"bytes": True}})
+            balance = me_data["me"]["bytes"]   # ✅
+
+        Wrong:
+            balance = me_data["me"]["myps"]    # ❌ always None from me endpoint
     """
     uid:              str
     username:         str
-    usergroup:        str
+    usergroup:        str   # numeric group ID as string — "7"=exiled, "38"=banned
     displaygroup:     str
     additionalgroups: str
-    postnum:          str   # post count
+    postnum:          str   # total post count — useful for change-gating discovery calls
     awards:           str
-    bytes:            str   # bytes balance
-    threadnum:        str   # thread count
+    bytes:            str   # byte balance — NOTE: field is "bytes" here, NOT "myps"
+    threadnum:        str   # total thread count — useful for change-gating own_tids sweep
     avatar:           str   # avatar URL
     avatardimensions: str
     avatartype:       str
     lastvisit:        str   # unix timestamp
     usertitle:        str
     website:          str
-    timeonline:       str   # seconds
+    timeonline:       str   # seconds online
     reputation:       str   # popularity score
     referrals:        str
-    vault:            NotRequired[str]  # API client vault balance
-    # Advanced Info scope required:
-    lastactive:       NotRequired[str]
-    unreadpms:        NotRequired[str]
-    invisible:        NotRequired[str]
-    totalpms:         NotRequired[str]
-    warningpoints:    NotRequired[str]
+    vault:            NotRequired[str]   # API client vault balance
+    # Advanced Info scope required for fields below:
+    lastactive:       NotRequired[str]   # unix timestamp of last activity
+    unreadpms:        NotRequired[str]   # current unread PM count
+    invisible:        NotRequired[str]   # "1" if browsing invisibly
+    totalpms:         NotRequired[str]   # lifetime PM count
+    warningpoints:    NotRequired[str]   # active warning points from moderators
 
 
 # ── Users ──────────────────────────────────────────────────────────────────────
@@ -60,7 +74,7 @@ class HFMe(TypedDict):
 class HFUser(TypedDict):
     """
     /read/users response. Requires 'Users' scope.
-    Note: 'myps' is the bytes balance alias in the users endpoint.
+    Note: byte balance is "myps" here (alias) — different from "bytes" in HFMe.
     """
     uid:              str
     username:         str
@@ -69,7 +83,7 @@ class HFUser(TypedDict):
     additionalgroups: str
     postnum:          str   # alias: post count
     awards:           str
-    myps:             str   # alias: bytes balance
+    myps:             str   # alias: bytes balance — NOTE: "myps" here, not "bytes"
     threadnum:        str   # alias: thread count
     avatar:           str
     avatardimensions: str
@@ -87,6 +101,10 @@ class HFPost(TypedDict):
     """
     /read/posts response. Requires 'Posts' scope.
     message field contains raw BBCode — use HFBBCode.to_text() to strip.
+
+    username is a free inline field — request it via "username": True in your
+    asks dict and it comes back at zero extra cost, eliminating a follow-up
+    users _uid call just to get the poster's display name.
     """
     pid:        str
     tid:        str
@@ -98,7 +116,8 @@ class HFPost(TypedDict):
     edituid:    str   # UID of last editor (empty if never edited)
     edittime:   str   # unix timestamp of last edit
     editreason: str   # reason for last edit
-    # Optional nested objects (requested via author field):
+    # Optional fields — present when explicitly requested:
+    username:   NotRequired[str]   # poster's username — free inline field, no extra API cost
     author:     NotRequired["HFUser"]
 
 
@@ -117,10 +136,15 @@ class HFFirstPost(TypedDict):
     Inline OP post object returned when firstpost:True is requested in a threads ask.
     This is NOT a post ID — it is a small dict containing the OP's pid and raw BBCode message.
 
-    Usage:
-        fp      = thread.get("firstpost") or {}
-        pid     = fp.get("pid", "")
-        snippet = HFBBCode.to_text(fp.get("message", ""))
+    DEFENSIVE HANDLING REQUIRED:
+        The API occasionally returns firstpost as a single-element list instead of a plain
+        dict. Always unwrap defensively before accessing fields:
+
+            fp = thread.get("firstpost") or {}
+            if isinstance(fp, list):
+                fp = fp[0] if fp else {}
+            pid     = fp.get("pid", "")
+            snippet = HFBBCode.to_text(fp.get("message", ""))
     """
     pid:     str
     message: str   # raw BBCode — use HFBBCode.to_text() to strip
@@ -134,6 +158,7 @@ class HFThread(TypedDict):
     firstpost  — when requested via firstpost:True, returns an HFFirstPost dict
                  {pid, message} containing the OP's post ID and raw BBCode content.
                  It is NOT just a post ID string. Omitted entirely if not requested.
+                 NOTE: can come back as a single-element list — always unwrap defensively.
     """
     tid:           str
     uid:           str   # OP user ID
@@ -151,9 +176,7 @@ class HFThread(TypedDict):
     poll:          str   # "1" if has poll
     username:      str   # OP username
     sticky:        str   # "1" if sticky
-    bestpid:       str   # best post ID (if voted)
-    # firstpost is only present when explicitly requested (firstpost:True in asks).
-    # Returns {pid, message} — NOT a bare post ID string.
+    bestpid:       str   # best post ID (if voted, "0" if none)
     firstpost:     NotRequired["HFFirstPost"]
 
 
@@ -232,6 +255,9 @@ class HFContract(TypedDict):
     """
     /read/contracts response. Requires 'Contracts' scope.
 
+    OWNER-SCOPED: contracts _uid only returns contracts for the authenticated
+    token's own user. You cannot read another user's contracts with your token.
+
     Type field reflects the initiator's position:
         buying, selling, exchanging, trading, vouch_copy
 
@@ -269,7 +295,7 @@ class HFContract(TypedDict):
     # Optional nested objects:
     inituser:      NotRequired["HFUser"]
     otheruser:     NotRequired["HFUser"]
-    escrow:        NotRequired["HFUser"]    # middleman user object
+    escrow:        NotRequired["HFUser"]          # middleman user object
     thread:        NotRequired["HFContractThread"]
     idispute:      NotRequired["HFContractDispute"]
     odispute:      NotRequired["HFContractDispute"]
@@ -282,6 +308,7 @@ class HFContract(TypedDict):
 class HFBrating(TypedDict):
     """
     /read/bratings response. Requires 'Contracts' scope.
+    OWNER-SCOPED: _uid only returns ratings for the authenticated token's user.
     amount: "+1" or "-1"
     """
     crid:       str   # b-rating ID
@@ -360,13 +387,49 @@ class HFSigmarketOrder(TypedDict):
 
 class HFEventThreadReply(TypedDict):
     """Fired by HFWatcher.watch_thread() on new reply."""
-    event:    str   # "thread_reply"
+    event:    str        # "thread_reply"
     tid:      int
     pid:      int | None
     uid:      str
+    username: str        # inline from posts fetch — no extra API call
     subject:  str
-    snippet:  str   # first 200 chars, BBCode stripped
+    snippet:  str        # first 200 chars, BBCode stripped
     dateline: int
+
+
+class HFEventThreadBestAnswer(TypedDict):
+    """
+    Fired by HFWatcher.watch_thread() when a post is marked as the best answer.
+    Zero extra API cost — bestpid is fetched as part of the standard thread poll.
+    """
+    event:   str   # "thread_best_answer"
+    tid:     int
+    pid:     str   # post ID marked as best
+    subject: str
+
+
+class HFEventThreadViewSpike(TypedDict):
+    """
+    Fired by HFWatcher.watch_thread() when views jump by 500+ in one poll cycle.
+    Indicates a thread going viral or unusual attention (e.g. mod review).
+    Zero extra API cost — views is fetched as part of the standard thread poll.
+    Threshold configurable via _VIEW_SPIKE_THRESHOLD in HFWatcher.
+    """
+    event:   str   # "thread_view_spike"
+    tid:     int
+    subject: str
+    spike:   int   # new views since last poll
+    views:   int   # current total
+
+
+class HFEventThreadClosed(TypedDict):
+    """
+    Fired by HFWatcher.watch_thread() when a thread transitions from open to closed.
+    Zero extra API cost — closed is fetched as part of the standard thread poll.
+    """
+    event:   str   # "thread_closed"
+    tid:     int
+    subject: str
 
 
 class HFEventNewThread(TypedDict):
