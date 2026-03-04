@@ -2,9 +2,6 @@
 HFBratings — read b-rating (buyer/seller rating) data.
 Requires 'Contracts' scope.
 
-BUG FIX #1: All methods now call self.read_sync() instead of self.read().
-self.read() is an async coroutine — calling it without await returns a coroutine
-object, not a dict. self.read_sync() runs the coroutine synchronously.
 """
 
 from HFClient import HFClient
@@ -35,7 +32,7 @@ class HFBratings(HFClient):
         return self._unwrap(data, "bratings")
 
     def get_received(self, uid: int, page: int = 1, perpage: int = 30) -> list[dict]:
-        """Get b-ratings received by a user."""
+        """Get b-ratings received by a user (single page)."""
         data = self.read_sync({"bratings": {
             "_to":      [uid],
             "_page":    page,
@@ -45,7 +42,7 @@ class HFBratings(HFClient):
         return self._unwrap(data, "bratings")
 
     def get_given(self, uid: int, page: int = 1, perpage: int = 30) -> list[dict]:
-        """Get b-ratings given by a user."""
+        """Get b-ratings given by a user (single page)."""
         data = self.read_sync({"bratings": {
             "_from":    [uid],
             "_page":    page,
@@ -60,8 +57,10 @@ class HFBratings(HFClient):
         return self._unwrap(data, "bratings")
 
     def get_score(self, uid: int) -> int:
-        """Calculate total b-rating score for a user (sum of received amounts)."""
-        ratings = self.get_received(uid, perpage=30)
+        """
+        Calculate total b-rating score for a user (sum of all received amounts).
+        """
+        ratings = self.get_all_received(uid)
         return sum(int(r.get("amount", 0)) for r in ratings)
 
     def get_all_received(self, uid: int, perpage: int = 30, max_pages: int = 50) -> list[dict]:
