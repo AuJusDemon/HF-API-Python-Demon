@@ -27,10 +27,9 @@ Usage:
     print(result.users[0]["myps"])
     print(result.threads[0]["subject"])
 
-Bug fix (Bug #5): bytes_sent and bytes_received previously both wrote to
-self._asks["bytes"], so calling both in one batch silently discarded one.
-A clear ValueError is now raised if you attempt to batch both directions
-at once — use two separate fetches instead.
+Note: bytes_sent() and bytes_received() cannot be combined in one batch —
+the HF API only supports one "bytes" key per request. Calling both raises
+ValueError. Use two separate fetch() calls instead.
 """
 
 from __future__ import annotations
@@ -104,16 +103,13 @@ class HFBatch:
 
     Chain calls to describe what you want, then call fetch() once.
 
-    BUG #5 FIX: bytes_sent() and bytes_received() both previously wrote to
-    self._asks["bytes"], so the second call silently overwrote the first.
-    Calling both in the same batch now raises ValueError immediately.
-    Use two separate batch fetches if you need both directions.
+    Note: bytes_sent() and bytes_received() cannot be combined in one batch.
+    Use two separate fetch() calls if you need both directions.
     """
 
     def __init__(self, client):
         self._client = client
         self._asks:  dict = {}
-        # Track which bytes direction has been added to detect collision
         self._bytes_direction: str | None = None  # "sent" | "received"
 
     def _reset(self) -> None:
@@ -319,6 +315,13 @@ class HFBatch:
         perpage: int = 30,
         fields: dict | None = None,
     ) -> "HFBatch":
+        """
+        Include contracts in the batch.
+
+        OWNER-SCOPED: The contracts endpoint only returns contracts for the
+        authenticated token's own user. Pass your own UID or a list of cids
+        for specific contract lookups.
+        """
         ask: dict = fields or {
             "cid": True, "dateline": True, "otherdateline": True,
             "public": True, "status": True, "istatus": True, "ostatus": True,
