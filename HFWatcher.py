@@ -36,11 +36,11 @@ class _ThreadWatch:
 
     # Internal poll state
     _last_post:      int = field(default=0,   init=False, repr=False)
-    _num_replies:    int = field(default=0,   init=False, repr=False)  # Bug #3: edit detection
-    _lastposteruid:  str = field(default="",  init=False, repr=False)  # Bug #1
-    _bestpid:        str = field(default="",  init=False, repr=False)  # best answer tracking
-    _views:          int = field(default=0,   init=False, repr=False)  # view spike tracking
-    _closed:         str = field(default="",  init=False, repr=False)  # closed detection
+    _num_replies:    int = field(default=0,   init=False, repr=False)
+    _lastposteruid:  str = field(default="",  init=False, repr=False)
+    _bestpid:        str = field(default="",  init=False, repr=False)
+    _views:          int = field(default=0,   init=False, repr=False)
+    _closed:         str = field(default="",  init=False, repr=False)
     _seen_pids:      set = field(default_factory=set, init=False, repr=False)
 
 
@@ -70,7 +70,6 @@ class _KeywordWatch:
     callback: Callback
     interval: int   = 120
     fids:     list  = field(default_factory=list)
-    # Bug #6 fix: separate sets for thread IDs and post IDs
     _seen_tids: set = field(default_factory=set, init=False, repr=False)
     _seen_pids: set = field(default_factory=set, init=False, repr=False)
     _last_check: float = field(default_factory=time.time, init=False, repr=False)
@@ -82,8 +81,6 @@ class _BytesWatch:
     interval: int   = 60
     _seen_ids: set = field(default_factory=set, init=False, repr=False)
     _initialized: bool = field(default=False, init=False, repr=False)
-    # Bug #4 fix: uid scoped to the watch, not shared on self._my_uid
-    # None = not yet fetched, 0 = fetch failed transiently (retry next poll)
     _my_uid: int | None = field(default=None, init=False, repr=False)
 
 
@@ -244,20 +241,18 @@ class HFWatcher:
             await asyncio.sleep(w.interval)
 
     async def _poll_thread(self, w: _ThreadWatch) -> None:
-        # Bug #1 fix: added lastposteruid (was missing — caused redundant post fetches).
-        # Also added views, bestpid, closed for zero-cost event detection.
         meta = await self._hf.read({
             "threads": {
                 "_tid":          [w.tid],
                 "tid":           True,
                 "subject":       True,
                 "lastpost":      True,
-                "lastposteruid": True,   # Bug #1 fix: skip fetch when we were last poster
-                "lastposter":    True,   # free username string, no extra cost
+                "lastposteruid": True,
+                "lastposter":    True,
                 "numreplies":    True,
-                "views":         True,   # NEW: view spike detection
-                "bestpid":       True,   # NEW: best answer detection
-                "closed":        True,   # NEW: thread closed detection
+                "views":         True,
+                "bestpid":       True,
+                "closed":        True,
             }
         })
 
@@ -292,8 +287,6 @@ class HFWatcher:
             return
 
         # ── NEW: Best answer marked ───────────────────────────────────────────
-        # bestpid changes when someone votes a post as the best answer.
-        # "0" means no best answer set — ignore that transition.
         if bestpid and bestpid != "0" and bestpid != w._bestpid and w._bestpid != "":
             await w.callback({
                 "event":   "thread_best_answer",
@@ -330,7 +323,7 @@ class HFWatcher:
         if lastpost <= w._last_post:
             return
 
-        # ── Bug #1 fix: skip post fetch when token owner was last poster ──────
+        # ── Skip post fetch when token owner was last poster ──────────────────
         if w.my_uid and lastposteruid == w.my_uid:
             log.debug(f"watch_thread tid={w.tid}: last poster is us ({w.my_uid}), skipping post fetch")
             w._last_post     = lastpost
@@ -338,8 +331,7 @@ class HFWatcher:
             w._lastposteruid = lastposteruid
             return
 
-        # ── Bug #3 fix: skip post fetch when numreplies unchanged (it's an edit)
-        # lastpost updates on edits too, but numreplies does not.
+        # ── Skip post fetch when numreplies unchanged (edit, not new reply) ───
         if w._num_replies > 0 and numreplies == w._num_replies:
             log.debug(f"watch_thread tid={w.tid}: numreplies={numreplies} unchanged — edit, skipping post fetch")
             w._last_post     = lastpost
@@ -355,19 +347,23 @@ class HFWatcher:
                 "_perpage": 10,
                 "pid":      True,
                 "uid":      True,
-                "username": True,   # Bug #2 fix: was missing, free inline field
+                "username": True,
                 "dateline": True,
                 "message":  True,
             }
         })
 
+        # BUG FIX: save old_last_post BEFORE updating w._last_post.
+        # Previously w._last_post was updated first, making the dateline
+        # filter below evaluate to `dateline <= lastpost` (always true),
+        # which skipped every post and made thread_reply never fire.
+        old_last_post    = w._last_post
         w._last_post     = lastpost
         w._num_replies   = numreplies
         w._lastposteruid = lastposteruid
 
         if not post_data or "posts" not in post_data:
-            # Couldn't fetch posts — still fire a minimal reply event so caller
-            # isn't completely dark. uid/username/snippet are unknown.
+            # Couldn't fetch posts — fire a minimal event so caller isn't dark.
             await w.callback({
                 "event":    "thread_reply",
                 "tid":      w.tid,
@@ -390,8 +386,10 @@ class HFWatcher:
             pid      = int(post.get("pid") or 0)
             dateline = int(post.get("dateline") or 0)
 
-            if dateline <= w._last_post - (lastpost - w._last_post):
-                # Older than the window we care about
+            # Skip posts we've already processed (predates last recorded post).
+            # Uses old_last_post — the value BEFORE this poll's update — so
+            # we correctly emit posts that arrived since the previous poll.
+            if dateline <= old_last_post:
                 continue
             if pid in w._seen_pids:
                 continue
@@ -402,7 +400,7 @@ class HFWatcher:
                 "tid":      w.tid,
                 "pid":      pid,
                 "uid":      str(post.get("uid", "")),
-                "username": post.get("username") or lastposter,   # Bug #2 fix
+                "username": post.get("username") or lastposter,
                 "subject":  subject,
                 "snippet":  _strip_bbcode(post.get("message", ""))[:200],
                 "dateline": dateline,
@@ -594,7 +592,6 @@ class HFWatcher:
                 if not tid:
                     continue
 
-                # Bug #6 fix: check _seen_tids (not _seen_pids) for thread IDs
                 if tid in w._seen_tids:
                     continue
 
@@ -617,7 +614,6 @@ class HFWatcher:
                 for post in (posts or []):
                     pid     = int(post.get("pid") or 0)
                     message = post.get("message", "")
-                    # Bug #6 fix: check _seen_pids (not _seen_tids) for post IDs
                     if pid in w._seen_pids:
                         continue
                     if w.pattern.search(message):
@@ -650,8 +646,6 @@ class HFWatcher:
             await asyncio.sleep(w.interval)
 
     async def _poll_bytes(self, w: _BytesWatch) -> None:
-        # Bug #4 fix: _my_uid is scoped to the _BytesWatch dataclass, not self.
-        # None = not yet fetched (retry next poll).
         if w._my_uid is None:
             me_data = await self._hf.read({"me": {"uid": True}})
             if not me_data or "me" not in me_data:
@@ -661,8 +655,6 @@ class HFWatcher:
                 me = me[0] if me else {}
             uid = int(me.get("uid") or 0)
             if not uid:
-                # Transient failure — leave as None and retry next poll.
-                # Bug #4: old code set this to 0 and permanently killed the watcher.
                 return
             w._my_uid = uid
 
