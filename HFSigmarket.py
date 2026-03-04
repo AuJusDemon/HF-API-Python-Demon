@@ -2,7 +2,6 @@
 HFSigmarket — read signature market listings and orders.
 Requires sigmarket scope.
 
-BUG FIX #1: self.read() changed to self.read_sync().
 """
 
 from HFClient import HFClient
@@ -40,8 +39,8 @@ class HFSigmarket(HFClient):
         """Get available signature market listings (type=market)."""
         ask: dict = {
             "_type":    "market",
-            "_page":    [page],
-            "_perpage": [perpage],
+            "_page":    page,       # BUG FIX: was [page] (list), must be plain int
+            "_perpage": perpage,    # BUG FIX: was [perpage] (list), must be plain int
             **_MARKET_FIELDS,
         }
         if uid:
@@ -54,7 +53,9 @@ class HFSigmarket(HFClient):
                 "postnum":    True,
                 "usergroup":  True,
             }
-        data = self.read_sync(ask)
+        # BUG FIX: was self.read_sync(ask) — missing {"sigmarket": ...} wrapper.
+        # The API expects the resource name as the top-level key.
+        data = self.read_sync({"sigmarket": ask})
         return self._unwrap(data, "sigmarket")
 
     def get_orders(
@@ -69,8 +70,8 @@ class HFSigmarket(HFClient):
         """Get signature market orders (type=order)."""
         ask: dict = {
             "_type":    "order",
-            "_page":    [page],
-            "_perpage": [perpage],
+            "_page":    page,       # BUG FIX: was [page]
+            "_perpage": perpage,    # BUG FIX: was [perpage]
             **_ORDER_FIELDS,
         }
         if buyer_uid:  ask["_buyer"]  = [buyer_uid]
@@ -80,7 +81,8 @@ class HFSigmarket(HFClient):
             user_fields = {"uid": True, "username": True, "reputation": True}
             ask["buyer"]  = user_fields
             ask["seller"] = user_fields
-        data = self.read_sync(ask)
+        # BUG FIX: was self.read_sync(ask) — missing {"sigmarket": ...} wrapper.
+        data = self.read_sync({"sigmarket": ask})
         return self._unwrap(data, "sigmarket")
 
     def get_all_listings(
@@ -95,6 +97,8 @@ class HFSigmarket(HFClient):
         results = HFPaginator._paginate(
             fetch_fn=lambda page: self.get_listings(uid=uid, page=page, perpage=perpage),
             max_pages=max_pages,
+            perpage=perpage,   # BUG FIX: was missing — paginator defaulted to 20,
+                               # breaking partial-page detection when perpage != 20
         )
         if active_only:
             return [r for r in results if str(r.get("active", "0")) == "1"]
@@ -115,6 +119,7 @@ class HFSigmarket(HFClient):
                 buyer_uid=buyer_uid, seller_uid=seller_uid, page=page, perpage=perpage
             ),
             max_pages=max_pages,
+            perpage=perpage,   # BUG FIX: was missing — same partial-page detection issue
         )
         if active_only:
             return [r for r in results if str(r.get("active", "0")) == "1"]
