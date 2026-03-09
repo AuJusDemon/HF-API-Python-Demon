@@ -1,8 +1,6 @@
-# HF API Configuration
-# Edit these values before using the library.
-
-HF_API_URL    = "https://hackforums.net/api/v2/"
-CLIENT_ID     = "hf_clientid_"
-SECRET_KEY    = "hf_secret_"
-REDIRECT_URI  = "http://127.0.0.1:8001/callback"
-STATE         = "authStateVariableDemo"
+import os
+HF_API_URL   = "https://hackforums.net/api/v2/"
+CLIENT_ID    = os.environ.get("HF_CLIENT_ID", "")
+SECRET_KEY   = os.environ.get("HF_CLIENT_SECRET", "")
+REDIRECT_URI = os.environ.get("HF_REDIRECT_URI", "")
+STATE        = os.environ.get("HF_STATE", "")
