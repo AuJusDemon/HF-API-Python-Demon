@@ -11,13 +11,53 @@ BUG FIXES:
        Users who want PMs + thread watching should use two separate watchers,
        or call watcher.watch_bytes() / watcher.watch_thread() directly and
        add a custom unreadpms poll on top.
+
+AVATAR URL NOTE:
+    The avatar field returns a relative path, e.g.:
+        "./uploads/avatars/avatar_761578.jpg?dateline=1772301324"
+    To build a usable URL: strip the leading "./" and prepend the HF base URL.
+    Use normalize_avatar_url() for this — it handles the None/empty case too.
 """
 
 from HFClient import HFClient
 
+_HF_BASE = "https://hackforums.net"
+
+
+def normalize_avatar_url(avatar: str | None) -> str | None:
+    """
+    Convert a relative HF avatar path to an absolute URL.
+
+    The API returns relative paths like "./uploads/avatars/avatar_761578.jpg".
+    This function strips the "./" prefix and prepends the HF base URL.
+
+    Args:
+        avatar: Raw avatar value from the API response (may be None or empty).
+
+    Returns:
+        Full absolute URL string, or None if avatar is absent/empty.
+
+    Example:
+        normalize_avatar_url("./uploads/avatars/avatar_761578.jpg?dateline=123")
+        # "https://hackforums.net/uploads/avatars/avatar_761578.jpg?dateline=123"
+
+        normalize_avatar_url(None)   # None
+        normalize_avatar_url("")     # None
+    """
+    if not avatar:
+        return None
+    if avatar.startswith("./"):
+        avatar = avatar[2:]
+    if avatar.startswith("http"):
+        return avatar
+    return f"{_HF_BASE}/{avatar}"
+
 
 class HFMe(HFClient):
     """Access info about the authenticated user (/read/me endpoint)."""
+
+    # Expose as a static method for convenience
+    normalize_avatar_url = staticmethod(normalize_avatar_url)
 
     def get(self, advanced: bool = True) -> dict | None:
         """
@@ -29,6 +69,10 @@ class HFMe(HFClient):
 
         Returns:
             Dict with user fields or None on failure.
+
+        Note on avatar:
+            The 'avatar' field is a relative path like "./uploads/avatars/...".
+            Use normalize_avatar_url(me["avatar"]) to get an absolute URL.
         """
         ask = {
             "uid": True, "username": True, "usergroup": True,
@@ -63,6 +107,20 @@ class HFMe(HFClient):
         me = self.get(advanced=False)
         return int(float(me.get("reputation", 0))) if me else 0
 
+    def get_avatar_url(self) -> str | None:
+        """
+        Get the authenticated user's avatar as an absolute URL.
+
+        Convenience method that calls get() and normalizes the avatar path.
+
+        Returns:
+            Absolute avatar URL or None if no avatar is set.
+        """
+        me = self.get(advanced=False)
+        if not me:
+            return None
+        return normalize_avatar_url(me.get("avatar"))
+
     def watch_pms(
         self,
         callback,
@@ -72,12 +130,6 @@ class HFMe(HFClient):
         Watch for new private messages by polling unreadpms.
 
         Fires the callback whenever the unread PM count increases.
-
-        BUG #8 FIX: The original implementation monkey-patched watcher.start()
-        to ONLY run the PM loop, silently killing any other registered watches
-        on the same HFWatcher instance. E.g. if you did:
-            watcher.watch_thread(...).watch_pms(...)
-        only watch_pms would ever fire.
 
         Fix: watch_pms() now creates and returns a FRESH, isolated HFWatcher
         whose sole task is the PM poll loop. It does not touch any other watcher.
