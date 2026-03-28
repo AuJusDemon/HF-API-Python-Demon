@@ -13,12 +13,74 @@ Usage:
 All fields are strings (HF API returns everything as strings, even numbers).
 Use int(post["pid"]) or float(tx["amount"]) when you need numeric types.
 
+BYTES AMOUNT WARNING:
+    bytes.amount is a float string (e.g. "430.43"). Use int(float(x)), never
+    int(x) directly. See parse_amount() in HFBytes.py.
+
 Optional fields are marked with NotRequired — they're only present when
 you explicitly requested them in your asks dict (nested objects like
 inituser, escrow, ibrating, etc.)
 """
 
 from typing import TypedDict, NotRequired
+
+
+# ── Bytes transaction type codes (confirmed live, 290+ transactions) ───────────
+#
+# Use these constants when filtering tx["type"] instead of raw string literals.
+# The 'don' code is the only one that appears on both sides — all real peer-to-peer
+# byte transfers (including contract payments) use 'don'. To isolate contract
+# payments specifically: type == BYTES_TYPE_TRANSFER and reason == "Contract".
+
+BYTES_TYPE_TRANSFER       = "att"  # OUT: Manual bytes send to another user
+BYTES_TYPE_BLACKJACK      = "bla"  # IN:  Blackjack winner
+BYTES_TYPE_BONUS          = "bon"  # IN:  Bonus (event award, quick love bonus)
+BYTES_TYPE_BUMP           = "bum"  # OUT: Thread bump fee (~50 bytes via Stanley)
+BYTES_TYPE_COINFLIP_LOSS  = "cfl"  # OUT: Coin flips loser
+BYTES_TYPE_COINFLIP_WIN   = "cfw"  # IN:  Coin flips winner
+BYTES_TYPE_CRYPTO_BUY     = "cgp"  # OUT: Crypto game coin purchase
+BYTES_TYPE_CRYPTO_SELL    = "cgs"  # IN:  Crypto game coin sell
+BYTES_TYPE_CONVO_RAIN     = "cvr"  # IN:  Convo rain
+BYTES_TYPE_PEER           = "don"  # IN/OUT: Peer-to-peer transfer; contract payments use this + reason="Contract"
+BYTES_TYPE_GAME_CASH      = "gce"  # OUT: Bytes to game cash exchange
+BYTES_TYPE_LOTTERY        = "ltb"  # OUT: Lottery ticket purchase
+BYTES_TYPE_QUICKLOVE_CONV = "qlc"  # IN:  Quick love convo
+BYTES_TYPE_QUICKLOVE_POST = "qlp"  # IN/OUT: Quick love post
+BYTES_TYPE_SPORTSBOOK_WIN = "sbs"  # IN:  Sportsbook winner
+BYTES_TYPE_SPORTSBOOK_BET = "sbw"  # OUT: Sportsbook wager
+BYTES_TYPE_SPORTSBOOK_REF = "sbc"  # IN:  Sportsbook cancel/refund
+BYTES_TYPE_SCRATCH        = "scp"  # OUT: Scratch card purchase
+BYTES_TYPE_SLOTS          = "slo"  # IN:  Slots winner
+BYTES_TYPE_UPGRADE_BONUS  = "ugb"  # IN:  Upgrade bonus
+
+# Codes that indicate a gambling win (useful for bundling alerts)
+BYTES_GAMBLING_WIN_TYPES = {
+    BYTES_TYPE_SLOTS,
+    BYTES_TYPE_BLACKJACK,
+    BYTES_TYPE_SPORTSBOOK_WIN,
+    BYTES_TYPE_CRYPTO_SELL,
+    BYTES_TYPE_COINFLIP_WIN,
+}
+
+# ── Contract status codes (confirmed live) ─────────────────────────────────────
+#
+# The API always returns numeric strings — never text labels like "complete".
+# Import these from HFContracts instead for full constants + label maps.
+
+CONTRACT_STATUS_AWAITING  = "1"   # Awaiting Approval
+CONTRACT_STATUS_CANCELLED = "2"   # Cancelled
+CONTRACT_STATUS_ACTIVE    = "5"   # Active Deal
+CONTRACT_STATUS_COMPLETE  = "6"   # Complete
+CONTRACT_STATUS_DISPUTED  = "7"   # Disputed
+CONTRACT_STATUS_EXPIRED   = "8"   # Expired
+
+# ── Contract type codes (confirmed live) ───────────────────────────────────────
+
+CONTRACT_TYPE_SELLING    = "1"
+CONTRACT_TYPE_BUYING     = "2"
+CONTRACT_TYPE_EXCHANGING = "3"
+CONTRACT_TYPE_TRADING    = "4"
+CONTRACT_TYPE_VOUCHCOPY  = "5"
 
 
 # ── Me ─────────────────────────────────────────────────────────────────────────
@@ -41,6 +103,11 @@ class HFMe(TypedDict):
 
         Wrong:
             balance = me_data["me"]["myps"]    # ❌ always None from me endpoint
+
+    AVATAR NOTE:
+        'avatar' is a relative path like "./uploads/avatars/avatar_761578.jpg".
+        Use HFMe.normalize_avatar_url(avatar) or HFUsers.normalize_avatar_url(avatar)
+        to get an absolute URL.
     """
     uid:              str
     username:         str
@@ -51,8 +118,8 @@ class HFMe(TypedDict):
     awards:           str
     bytes:            str   # byte balance — NOTE: field is "bytes" here, NOT "myps"
     threadnum:        str   # total thread count — useful for change-gating own_tids sweep
-    avatar:           str   # avatar URL
-    avatardimensions: str
+    avatar:           str   # relative path — use normalize_avatar_url() for full URL
+    avatardimensions: str   # pipe-separated "width|height" e.g. "120|120"
     avatartype:       str
     lastvisit:        str   # unix timestamp
     usertitle:        str
@@ -75,6 +142,10 @@ class HFUser(TypedDict):
     """
     /read/users response. Requires 'Users' scope.
     Note: byte balance is "myps" here (alias) — different from "bytes" in HFMe.
+
+    AVATAR NOTE:
+        'avatar' is a relative path like "./uploads/avatars/avatar_761578.jpg".
+        Use HFUsers.normalize_avatar_url(avatar) to get an absolute URL.
     """
     uid:              str
     username:         str
@@ -85,8 +156,8 @@ class HFUser(TypedDict):
     awards:           str
     myps:             str   # alias: bytes balance — NOTE: "myps" here, not "bytes"
     threadnum:        str   # alias: thread count
-    avatar:           str
-    avatardimensions: str
+    avatar:           str   # relative path — use normalize_avatar_url() for full URL
+    avatardimensions: str   # pipe-separated "width|height" e.g. "120|120"
     avatartype:       str
     usertitle:        str
     website:          str
@@ -159,13 +230,19 @@ class HFThread(TypedDict):
                  {pid, message} containing the OP's post ID and raw BBCode content.
                  It is NOT just a post ID string. Omitted entirely if not requested.
                  NOTE: can come back as a single-element list — always unwrap defensively.
+
+    numreplies NOTE:
+        numreplies from threads._uid is known to be unreliable — the value can
+        lag or be stale. Do not use it for critical logic such as deciding
+        whether a new post has arrived. HFWatcher uses it as a change-gate
+        but may occasionally miss a reply as a result.
     """
     tid:           str
     uid:           str   # OP user ID
     fid:           str   # forum ID
     subject:       str
     closed:        str   # "1" if closed
-    numreplies:    str
+    numreplies:    str   # WARNING: may be stale when fetched via threads._uid
     views:         str
     dateline:      str   # unix timestamp of thread creation
     lastpost:      str   # unix timestamp of last reply — NOT a post ID
@@ -194,12 +271,13 @@ class HFThreadWriteResult(TypedDict):
 class HFForum(TypedDict):
     """
     /read/forums response. Requires 'Posts' scope.
-    type: "f" = forum, "c" = category, "l" = link
+    type: "f" = forum (has threads), "c" = category (container only, no threads)
+    Never use type="c" forums as _fid inputs — they will always return empty.
     """
     fid:         str
     name:        str
     description: str
-    type:        str   # "f", "c", or "l"
+    type:        str   # "f" = forum, "c" = category
 
 
 # ── Bytes ──────────────────────────────────────────────────────────────────────
@@ -207,12 +285,20 @@ class HFForum(TypedDict):
 class HFBytesTx(TypedDict):
     """
     /read/bytes response. Requires 'Bytes' scope.
-    type: "send", "deposit", "withdraw", "bump", etc.
+
+    type: one of the BYTES_TYPE_* constants defined in this module.
+    The 'don' type (BYTES_TYPE_PEER) is used for all real peer-to-peer transfers.
+    To isolate contract payments: type == "don" and reason == "Contract".
+
+    AMOUNT CAST WARNING:
+        amount is a float string (e.g. "430.43"). Always cast via
+        int(float(tx["amount"])) — never int(tx["amount"]) directly.
+        int("430.43") raises ValueError. Use HFBytes.parse_amount() for safety.
     """
     id:       str   # transaction ID
-    amount:   str   # positive = received, negative = sent
+    amount:   str   # float string e.g. "430.43" — use int(float(x)) to cast
     dateline: str   # unix timestamp
-    type:     str   # transaction type
+    type:     str   # transaction type code — see BYTES_TYPE_* constants above
     reason:   str   # optional reason
     # Optional nested objects:
     from_:    NotRequired["HFUser"]   # sender (key is "from" in API)
@@ -258,14 +344,22 @@ class HFContract(TypedDict):
     OWNER-SCOPED: contracts _uid only returns contracts for the authenticated
     token's own user. You cannot read another user's contracts with your token.
 
-    Type field reflects the initiator's position:
-        buying, selling, exchanging, trading, vouch_copy
+    STATUS — numeric strings (not text labels):
+        "1" = Awaiting Approval   "2" = Cancelled
+        "5" = Active Deal         "6" = Complete
+        "7" = Disputed            "8" = Expired
+        Use CONTRACT_STATUS_* constants or HFContracts.CONTRACT_STATUS_* for comparisons.
 
-    Status field values:
-        active, complete, incomplete, cancelled
+    TYPE — numeric strings (not text labels):
+        "1" = Selling   "2" = Buying   "3" = Exchanging
+        "4" = Trading   "5" = Vouch Copy
+        Use CONTRACT_TYPE_* constants or HFContracts.CONTRACT_TYPE_* for comparisons.
 
-    istatus / ostatus: "pending" | "approved" | "denied"
-    muid: non-empty = middleman/escrow contract
+    APPROVAL FLAGS:
+        istatus / ostatus: "0" = not yet approved, "1" = approved
+        These are per-party flags, independent of overall status.
+
+    muid: non-empty string = middleman/escrow contract
     """
     cid:           str
     dateline:      str   # contract start unix timestamp
@@ -273,20 +367,20 @@ class HFContract(TypedDict):
     public:        str   # "1" if public
     timeout_days:  str
     timeout:       str   # unix timestamp of timeout
-    status:        str   # overall status
-    istatus:       str   # initiator status
-    ostatus:       str   # other party status
+    status:        str   # numeric status code — see CONTRACT_STATUS_* constants
+    istatus:       str   # initiator approval: "0"=pending, "1"=approved
+    ostatus:       str   # other party approval: "0"=pending, "1"=approved
     cancelstatus:  str   # cancellation request status
-    type:          str   # contract type
+    type:          str   # numeric type code — see CONTRACT_TYPE_* constants
     tid:           str   # linked thread ID
     inituid:       str   # initiator UID
     otheruid:      str   # other party UID
-    muid:          str   # middleman UID (empty = no middleman)
+    muid:          str   # middleman UID (empty string = no middleman)
     iprice:        str   # initiator's price
     oprice:        str   # other party's price
     iproduct:      str   # initiator's product description
     oproduct:      str   # other party's product description
-    icurrency:     str   # initiator's currency (bytes, usd, btc, etc.)
+    icurrency:     str   # initiator's currency (bytes, usd, btc, other, etc.)
     ocurrency:     str   # other party's currency
     terms:         str   # contract terms text
     iaddress:      str   # initiator's payment address
@@ -507,8 +601,8 @@ class HFBatchResult(TypedDict, total=False):
 class HFContractSummary(TypedDict):
     """Return type from HFContracts.get_summary()."""
     total:                int
-    by_status:            dict[str, int]
-    by_type:              dict[str, int]
+    by_status:            dict[str, int]   # keys are human-readable labels e.g. "Active Deal"
+    by_type:              dict[str, int]   # keys are human-readable labels e.g. "Selling"
     middleman:            int
     disputed:             int
     cancellation_pending: int
