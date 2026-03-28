@@ -2,8 +2,10 @@
 HFBytes — send and read bytes transactions on HackForums.
 Read requires 'Bytes' scope. Write requires 'Bytes Write' scope.
 
-BUG FIX #1: All methods now call self.read_sync() / self.write_sync() instead
-of the bare async self.read() / self.write() coroutines that were never awaited.
+AMOUNT CAST WARNING:
+    bytes.amount is a float string (e.g. "430.43"). You MUST cast via
+    int(float(x)) — never int(x) directly. int("430.43") raises ValueError.
+    Use the provided parse_amount() helper for safety.
 """
 
 from HFClient import HFClient
@@ -29,9 +31,38 @@ _FIELDS_LIGHT = {
 }
 
 
+def parse_amount(raw) -> int:
+    """
+    Safely parse a bytes transaction amount to int.
+
+    The API returns amount as a float string (e.g. "430.43"). Direct int()
+    casting raises ValueError — always go through float first.
+
+    Args:
+        raw: The raw amount value from the API response.
+
+    Returns:
+        Integer byte amount (fractional part is truncated, not rounded).
+
+    Example:
+        int("430.43")            # raises ValueError — WRONG
+        parse_amount("430.43")   # returns 430 — CORRECT
+        parse_amount(None)       # returns 0 — safe default
+    """
+    try:
+        return int(float(raw or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 class HFBytes(HFClient):
     """
     Send and read bytes transactions (/read/bytes and /write/bytes endpoints).
+
+    AMOUNT CAST WARNING:
+        bytes.amount comes back as a float string like "430.43".
+        Never cast with int(x) — use int(float(x)) or parse_amount(x).
+        int("430.43") will raise ValueError and crash.
 
     Usage:
         bytes_api = HFBytes(access_token)
@@ -40,7 +71,14 @@ class HFBytes(HFClient):
         bytes_api.withdraw(50)
         bytes_api.bump(tid=6083735)
         txs = bytes_api.get_received(uid=761578)
+
+        # Safe amount parsing:
+        for tx in txs:
+            amount = parse_amount(tx["amount"])   # always use this
     """
+
+    # Expose module-level helper as a static method for convenience
+    parse_amount = staticmethod(parse_amount)
 
     def send(self, to_uid: int, amount: int, reason: str = "", pid: int = 0) -> str | None:
         """Send bytes to a user. Returns transaction ID or None on failure."""
@@ -76,7 +114,12 @@ class HFBytes(HFClient):
         perpage: int = 20,
         include_post: bool = False,
     ) -> list[dict]:
-        """Get bytes transactions received by a user."""
+        """
+        Get bytes transactions received by a user.
+
+        Note: tx["amount"] is a float string ("430.43"). Use parse_amount()
+        or int(float(tx["amount"])) — never int(tx["amount"]) directly.
+        """
         fields = dict(_FIELDS) if include_post else dict(_FIELDS_LIGHT)
         data = self.read_sync({"bytes": {
             "_to":      [uid],
@@ -93,7 +136,12 @@ class HFBytes(HFClient):
         perpage: int = 20,
         include_post: bool = False,
     ) -> list[dict]:
-        """Get bytes transactions sent by a user."""
+        """
+        Get bytes transactions sent by a user.
+
+        Note: tx["amount"] is a float string ("430.43"). Use parse_amount()
+        or int(float(tx["amount"])) — never int(tx["amount"]) directly.
+        """
         fields = dict(_FIELDS) if include_post else dict(_FIELDS_LIGHT)
         data = self.read_sync({"bytes": {
             "_from":    [uid],
