@@ -1,13 +1,16 @@
 """
 HFClient.py — Async HTTP client for the HackForums API v2.
 
-BUG FIXES:
-  #1  — Added read_sync() / write_sync() so resource classes (which are not
-         async) can call self.read_sync(...) instead of the bare coroutine
-         self.read(...) that was previously returned un-awaited.
-  #10 — verify=False was applied to all requests globally. SSL verification
-         is now only disabled when a proxy is configured (proxies can break
-         the cert chain); direct requests to HF use proper TLS verification.
+IMPROVEMENT #15 — Rate limit TTL auto-clear:
+    HF's rate limit window is 1 hour. The previous backoff was a fixed
+    10-minute block with no awareness of the window resetting. A token
+    rate-limited at 23:59 would stay blocked until 00:09 even though the
+    new window opened at 00:00.
+
+    Now: if a token was blocked more than 65 minutes ago, the block is
+    automatically cleared on the next call (the window has definitely reset).
+    The 65-minute TTL is also applied to the remaining-call tracking so
+    stale entries don't linger in memory indefinitely.
 """
 
 import asyncio
@@ -33,22 +36,68 @@ _DEFAULT_TIMEOUT = httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=5.0)
 
 # ── Per-token rate limit state ─────────────────────────────────────────────────
 
-_rate_limited_until:   dict[str, float] = {}
-_rate_limit_remaining: dict[str, int]   = {}
-_RATE_LIMIT_BACKOFF = 600
+# Backoff applied immediately after hitting MAX_HOURLY_CALLS
+_RATE_LIMIT_BACKOFF = 600          # 10 minutes — initial backoff period
+
+# HF's rate limit window. After this long, the window has reset and the
+# block is auto-cleared regardless of backoff state.
+_RATE_LIMIT_WINDOW  = 65 * 60     # 65 minutes — slightly longer than HF's 1-hour window
+
+_rate_limited_until: dict[str, float] = {}   # token → resume unix timestamp
+_rate_limited_since: dict[str, float] = {}   # token → blocked_at unix timestamp
+_rate_limit_remaining: dict[str, tuple[int, float]] = {}  # token → (remaining, timestamp)
 
 
 def get_rate_limit_remaining(token: str) -> int:
-    return _rate_limit_remaining.get(token, 9999)
+    """Return last known remaining call count. 9999 if unknown or stale."""
+    entry = _rate_limit_remaining.get(token)
+    if not entry:
+        return 9999
+    remaining, ts = entry
+    # Stale after 65 minutes — the window has reset
+    if time.time() - ts > _RATE_LIMIT_WINDOW:
+        _rate_limit_remaining.pop(token, None)
+        return 9999
+    return remaining
 
 
 def is_rate_limited(token: str) -> bool:
-    return time.time() < _rate_limited_until.get(token, 0)
+    """
+    Return True if this token should not make any more API calls right now.
+
+    Auto-clears the block if:
+      - The 10-minute backoff period has expired, OR
+      - More than 65 minutes have passed since blocking (HF window has reset)
+    """
+    until = _rate_limited_until.get(token, 0)
+    if not until:
+        return False
+
+    now = time.time()
+
+    # Standard backoff expiry
+    if now >= until:
+        _rate_limited_until.pop(token, None)
+        _rate_limited_since.pop(token, None)
+        return False
+
+    # Window auto-clear: if blocked more than 65 minutes ago, the hourly
+    # rate limit window has definitely reset — safe to unblock
+    since = _rate_limited_since.get(token, 0)
+    if since and (now - since) > _RATE_LIMIT_WINDOW:
+        log.info(f"Rate limit window reset for token ...{token[-6:]} — unblocking")
+        _rate_limited_until.pop(token, None)
+        _rate_limited_since.pop(token, None)
+        return False
+
+    return True
 
 
 def _mark_rate_limited(token: str) -> None:
-    resume = time.time() + _RATE_LIMIT_BACKOFF
+    now    = time.time()
+    resume = now + _RATE_LIMIT_BACKOFF
     _rate_limited_until[token] = resume
+    _rate_limited_since[token] = now
     log.warning(
         f"HF rate limit hit — pausing token ...{token[-6:]} for 10 minutes "
         f"(resumes {time.strftime('%H:%M:%S', time.localtime(resume))})"
@@ -61,7 +110,7 @@ def _update_remaining(token: str, headers: httpx.Headers) -> None:
         return
     try:
         remaining = int(raw)
-        _rate_limit_remaining[token] = remaining
+        _rate_limit_remaining[token] = (remaining, time.time())
         if remaining < 20:
             log.warning(f"HF rate limit low: {remaining} calls left this hour for token ...{token[-6:]}")
     except ValueError:
