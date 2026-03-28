@@ -2,9 +2,6 @@
 HFThreads — read and create threads on HackForums.
 Read requires 'Posts' scope. Create requires 'Posts Write' scope.
 
-BUG FIX #1: All self.read() / self.write() calls changed to
-self.read_sync() / self.write_sync().
-
 API NOTE — lastposter is a free field:
     Every thread object includes lastposter (the username of whoever last
     replied) at no extra cost. poll_lastpost() requests it by default so
@@ -16,6 +13,14 @@ API NOTE — get_by_user() returns OP threads only:
     Threads the user replied to but didn't create are invisible here.
     Use posts _uid (HFPosts.get_by_user) to discover all threads a user
     has participated in, then resolve to thread objects via get_many().
+
+API NOTE — numreplies is unreliable from threads._uid:
+    The numreplies field can be stale or lag behind the actual post count when
+    fetched via the _uid filter. Do not use numreplies as a definitive gate for
+    whether new posts exist — use lastpost (unix timestamp) instead. HFWatcher
+    uses numreplies as a secondary change-gate to skip post fetches on edits,
+    which can occasionally cause a real new reply to be missed if numreplies
+    hasn't updated yet. When fetching by _tid directly, numreplies is reliable.
 """
 
 from HFClient import HFClient
@@ -38,7 +43,12 @@ class HFThreads(HFClient):
         return threads[0] if threads else None
 
     def get_many(self, tids: list[int]) -> list[dict]:
-        """Get multiple threads by ID in one request (max 30)."""
+        """
+        Get multiple threads by ID in one request (max 30 per call).
+
+        WARNING: A single private or deleted TID in the list causes the whole
+        batch to return empty. If you hit this, bisect to find the bad TID.
+        """
         if not tids:
             return []
         data = self.read_sync({"threads": {"_tid": tids, **_FIELDS}})
@@ -57,6 +67,9 @@ class HFThreads(HFClient):
         original poster. Threads the user replied to but didn't start are
         not returned here. Use HFPosts.get_by_user() (posts _uid) to find
         all threads a user has participated in.
+
+        WARNING: numreplies from this endpoint can be stale. Use lastpost
+        (unix timestamp) as the primary change signal, not numreplies.
         """
         data = self.read_sync({"threads": {
             "_uid": [uid], "_page": page, "_perpage": perpage,
@@ -72,6 +85,9 @@ class HFThreads(HFClient):
         lastposter is the username of whoever last replied and is included
         free on every thread response — no follow-up users _uid call needed.
         Use lastposteruid if you also need their UID.
+
+        NOTE: numreplies can be stale when threads are fetched via _uid.
+        When fetching by _tid (as this method does), numreplies is reliable.
         """
         if not tids:
             return []
@@ -80,7 +96,7 @@ class HFThreads(HFClient):
             "tid":           True,
             "subject":       True,
             "lastpost":      True,
-            "lastposter":    True,  
+            "lastposter":    True,
             "lastposteruid": True,
             "numreplies":    True,
         }})
